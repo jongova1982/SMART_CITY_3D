@@ -305,6 +305,7 @@ class MonitoringDashboard(QMainWindow):
             self.connection.setText("●  SIMULACIÓN PAUSADA" if self._paused else "●  SIMULACIÓN LOCAL ACTIVA")
             self.connection.setStyleSheet("color:#86efac; padding:5px 10px; border:1px solid #24564a; border-radius:8px")
             summary = self.data.summary()
+            self._send_city({"action": "metrics", "data": summary})
             if hasattr(self, "demand_chart"):
                 self.demand_chart.add_sample(summary["zones"])
             self.city_status.setText(f"Visor 3D: activo · tiempo simulado {summary['simulation_time']:.0f} s · selección: {self._selected_asset or 'ninguna'}")
@@ -447,7 +448,9 @@ class MonitoringDashboard(QMainWindow):
         self.refresh()
 
     def change_speed(self, index):
-        self.simulation.engine.step_seconds = self.speed.itemData(index)
+        value = self.speed.itemData(index)
+        self.simulation.engine.step_seconds = value
+        self._send_city({"action": "speed", "value": value})
 
     def change_time(self, index):
         self._send_city({"action": "time", "mode": self.time_mode.itemData(index)})

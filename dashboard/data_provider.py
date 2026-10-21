@@ -30,6 +30,7 @@ class SimulationData:
                        sum(not v for v in sim.grid.traffic_lights.values()) +
                        sum(not v for v in sim.grid.street_lights.values())),
             "agents": len(sim.agents), "simulation_time": sim.engine.simulation_time,
+            "active_zones": sum(not zone.get("outage", False) for zone in zones.values()),
             "zones": zones,
         }
 

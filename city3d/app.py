@@ -45,7 +45,12 @@ class SmartCityApp(ShowBase):
         from panda3d.core import WindowProperties
         props = WindowProperties()
         props.setTitle("JONGOX Smart City | Visor 3D")
-        props.setSize(1440, 900)
+        screen_width=max(1024,int(self.pipe.getDisplayWidth() or 1680))
+        screen_height=max(700,int(self.pipe.getDisplayHeight() or 945))
+        width=min(1680,screen_width-40)
+        height=min(945,screen_height-80,int(width*9/16))
+        width=min(width,int(height*16/9))
+        props.setSize(width,height)
         if hasattr(self.win, "requestProperties"):
             self.win.requestProperties(props)
 
@@ -64,14 +69,22 @@ class SmartCityApp(ShowBase):
         self.layers = {"electrical": [], "gpon": []}
         self._assets = {}
         self._traffic_signals = []
+        self._traffic_layer_enabled = True
+        self._traffic_layer_root = self.render.attachNewNode("traffic-signal-layer")
+        self._lighting_layer_enabled = True
+        self._lighting_layer_root = self.render.attachNewNode("street-light-layer")
         self._intersection_signals = {}
         self._cars = []
         self._pedestrians = []
         self._simulation_time = 0.0
+        self._speed_multiplier = 1.0
+        self._hud_metrics = {}
         self._paused = False
         self._time_of_day_override = None
         self._quality_mode = "MEDIUM"
         self._quality_buttons = {}
+        self._speed_buttons = {}
+        self._sidebar_buttons = []
         self._zone_buttons = {}
         self._layer_buttons = {}
         self._time_buttons = {}
@@ -121,7 +134,11 @@ class SmartCityApp(ShowBase):
             except Exception:
                 break
             action = command.get("action") if isinstance(command, dict) else None
-            if action == "pause":
+            if action == "metrics":
+                self._update_hud_metrics(command.get("data", {}))
+            elif action == "speed":
+                self._set_speed(command.get("value", 1.0))
+            elif action == "pause":
                 paused = bool(command.get("paused"))
                 if paused != self._paused:
                     self._toggle_pause()
@@ -166,7 +183,7 @@ class SmartCityApp(ShowBase):
         self._camera_distance = 42.0
         self._place_camera_at_distance()
         self.camera.lookAt(0, 0, 1)
-        self._hud_selection.setText(f"Activo seleccionado: {asset_id}")
+        self._set_selected_hud(asset_id)
         return True
 
     def _set_layer_enabled(self, name, enabled):
@@ -628,14 +645,17 @@ class SmartCityApp(ShowBase):
             self._asset_box(f"OLT-{zid}-01",(cx+18,cy-18,1.25),(2.0,1.6,2.5),(.22,.61,.68,1),"gpon")
             for idx in range(4):
                 lx, ly = cx-18+idx*12, cy-20.8
-                self._asset_box(f"LAMP-{zid}-{idx}",(lx,ly,2.6),(.16,.16,5.2),(.30,.32,.31,1),"electrical")
-                self._asset_box(f"LAMP-HEAD-{zid}-{idx}",(lx+.65,ly,5.1),(1.5,.42,.18),(.86,.75,.43,1),"electrical")
+                lamp=self._asset_box(f"LAMP-{zid}-{idx}",(lx,ly,2.6),(.16,.16,5.2),(.30,.32,.31,1),"electrical")
+                lamp.wrtReparentTo(self._lighting_layer_root)
+                head=self._asset_box(f"LAMP-HEAD-{zid}-{idx}",(lx+.65,ly,5.1),(1.5,.42,.18),(.86,.75,.43,1),"electrical")
+                head.wrtReparentTo(self._lighting_layer_root)
                 self._asset_box(f"GPON-NAP-{zid}-{idx+1:02d}",(lx-.12,ly,4.35),(.66,.42,.58),(.91,.12,.18,1),"gpon")
                 self._asset_box(f"GPON-ARM-{zid}-{idx+1:02d}",(lx-.10,ly,4.72),(.12,.12,.55),(.48,.49,.48,1),"gpon")
             # Warm lamp bulbs read clearly while keeping just one sun and one ambient light.
             for idx in (1,3):
                 lx,ly=cx-18+idx*12,cy-20.8
                 bulb=self._asset_box(f"LAMP-BULB-{zid}-{idx}",(lx+.65,ly,5.05),(.44,.44,.22),(1.0,.72,.32,1),"electrical")
+                bulb.wrtReparentTo(self._lighting_layer_root)
                 bulb.setLightOff()
                 bulb.setColorScale(1.15,1.0,.72,1)
                 self.layers["electrical"].append(bulb)
@@ -694,7 +714,7 @@ class SmartCityApp(ShowBase):
                 for index, (z,color) in enumerate(zip((5.38,4.94,4.5),lens_colors)):
                     lens_node=GeomNode(f"signal-{ix}-{iy}-{dx}-{dy}-{index}")
                     lens_node.addGeom(bulb_geom)
-                    lens=self.render.attachNewNode(lens_node)
+                    lens=self._traffic_layer_root.attachNewNode(lens_node)
                     lens.setPos(x,y,z)
                     lens.setScale(.17,.14,.17)
                     lens.setColor(*color)
@@ -702,7 +722,7 @@ class SmartCityApp(ShowBase):
                     lenses.append(lens)
                     halo_node=GeomNode(f"signal-glow-{ix}-{iy}-{dx}-{dy}-{index}")
                     halo_node.addGeom(glow_geom)
-                    halo=self.render.attachNewNode(halo_node)
+                    halo=self._traffic_layer_root.attachNewNode(halo_node)
                     halo.setPos(x,y,z)
                     halo.setScale(.38,.30,.38)
                     halo.setColor(color[0],color[1],color[2],.24)
@@ -715,8 +735,9 @@ class SmartCityApp(ShowBase):
                 groups[axis].append(signal)
                 self._traffic_signals.append(signal)
             self._intersection_signals[(ix,iy)] = groups
-        self._mesh_batch("traffic-signal-poles",pole_boxes,(.19,.21,.21,1))
-        self._mesh_batch("traffic-signal-housings",housing_boxes,(.11,.13,.14,1))
+        for node in (self._mesh_batch("traffic-signal-poles",pole_boxes,(.19,.21,.21,1)),
+                     self._mesh_batch("traffic-signal-housings",housing_boxes,(.11,.13,.14,1))):
+            node.wrtReparentTo(self._traffic_layer_root)
 
     @staticmethod
     def _signal_state(axis, simulation_time):
@@ -767,10 +788,11 @@ class SmartCityApp(ShowBase):
         key = (aspect, bool(active))
         if key not in self._button_texture_cache:
             if active:
-                fills = ((.17,.88,.95,1),(.02,.61,.76,1),(.38,.95,.99,1),(.50,.59,.61,1))
+                fills = ((.04,.42,.77,1),(.02,.29,.58,1),(.12,.62,.98,1),(.47,.67,.82,1))
+                outline = (.00,.75,1,1)
             else:
-                fills = ((.015,.70,.90,1),(.00,.52,.70,1),(.20,.83,.96,1),(.50,.59,.61,1))
-            outline = (.94,.10,.16,1)
+                fills = ((.075,.15,.22,1),(.045,.10,.16,1),(.11,.22,.30,1),(.38,.53,.64,1))
+                outline = (.14,.30,.42,1)
             self._button_texture_cache[key] = tuple(
                 self._make_button_texture(f"control-{key}-{index}",aspect,fill,outline)
                 for index,fill in enumerate(fills)
@@ -784,8 +806,8 @@ class SmartCityApp(ShowBase):
         button["frameColor"] = (1,1,1,1)
         button["relief"] = "flat"
         button["borderWidth"] = (0,0)
-        button["text_fg"] = (.012,.045,.062,1)
-        button["text_scale"] = getattr(button,"control_text_scale",.90)
+        button["text_fg"] = (.97,.99,1,1) if active else (.86,.93,.98,1)
+        button["text_scale"] = getattr(button,"control_text_scale",.95)
         if self._button_font:
             button["text_font"] = self._button_font
         button.setTransparency(TransparencyAttrib.MAlpha)
@@ -806,19 +828,18 @@ class SmartCityApp(ShowBase):
         )
         self._hud_header_frame.setTransparency(TransparencyAttrib.MAlpha)
         self._hud_title = OnscreenText(
-            text="JONGOX  |  GEMELO DIGITAL URBANO",
-            pos=(-1.55,.95), align=TextNode.ALeft, scale=.047,
+            text="JONGOX  |  SMART CITY 3D",
+            pos=(-1.58,.91), align=TextNode.ALeft, scale=.047,
             fg=(.88,.93,.9,1), mayChange=False, shadow=(0,0,0,.7),
         )
         self._hud_help = OnscreenText(
-            text="Clic derecho: orbitar | rueda: acercar/alejar | clic central: desplazar\n"
-                 "Flechas/WASD: mover | Q/E: girar | +/-: zoom | 1/2: capas | R: inicio",
-            pos=(-1.55,.875), align=TextNode.ALeft, scale=.025,
+            text="GEMELO DIGITAL URBANO   |   Rueda: zoom / Clic derecho: orbitar / WASD: desplazar",
+            pos=(-1.58,.86), align=TextNode.ALeft, scale=.024,
             fg=(.65,.77,.78,1), mayChange=False, shadow=(0,0,0,.7),
         )
         self._hud_zones = OnscreenText(
-            text="A  RESIDENCIAL\nB  COMERCIAL\nC  INDUSTRIAL\nD  TECNOL\u00d3GICA",
-            pos=(1.55,.92), align=TextNode.ARight, scale=.026,
+            text="A  RESIDENCIAL   /   B  COMERCIAL   /   C  INDUSTRIAL   /   D  TECNOLÓGICA",
+            pos=(1.66,.94), align=TextNode.ARight, scale=.022,
             fg=(.93,.96,.93,1), mayChange=False, shadow=(0,0,0,.7),
         )
         self._hud_control_frame = DirectFrame(
@@ -826,13 +847,18 @@ class SmartCityApp(ShowBase):
             pos=(0,0,.61), relief=1,
         )
         self._hud_control_frame.setTransparency(TransparencyAttrib.MAlpha)
+        self._hud_control_frame.hide()
         self._hud_control_cards = [
             DirectFrame(frameColor=(.025,.063,.079,.99),
-                        frameSize=(-.59,.59,-.097,.085),pos=(-1.02,0,.61),relief=1),
+                        frameSize=(-.47,.47,-.115,.115),pos=(-1.29,0,.70),relief=1),
             DirectFrame(frameColor=(.025,.063,.079,.99),
-                        frameSize=(-.47,.47,-.097,.085),pos=(.105,0,.61),relief=1),
+                        frameSize=(-.33,.33,-.115,.115),pos=(-.47,0,.70),relief=1),
             DirectFrame(frameColor=(.025,.063,.079,.99),
-                        frameSize=(-.51,.51,-.097,.085),pos=(1.145,0,.61),relief=1),
+                        frameSize=(-.40,.40,-.115,.115),pos=(.28,0,.70),relief=1),
+            DirectFrame(frameColor=(.025,.063,.079,.99),
+                        frameSize=(-.235,.235,-.115,.115),pos=(.935,0,.70),relief=1),
+            DirectFrame(frameColor=(.025,.063,.079,.99),
+                        frameSize=(-.29,.29,-.115,.115),pos=(1.48,0,.70),relief=1),
         ]
         self._hud_control_rules = [
             DirectFrame(frameColor=(.16,.39,.43,.95), frameSize=(-.002,.002,-.10,.10),
@@ -864,25 +890,31 @@ class SmartCityApp(ShowBase):
         )
         self._hud_selection = OnscreenText(
             text="Activo seleccionado: ninguno",
-            pos=(-1.29,-.94), align=TextNode.ALeft, scale=.032,
+            pos=(1.67,.34), align=TextNode.ARight, scale=.026,
             fg=(.95,.78,.38,1), mayChange=True, shadow=(0,0,0,.7),
         )
+        # The equipment card is the single source of selection feedback.
+        self._hud_selection.hide()
         self._hud_quality = OnscreenText(
-            text="CALIDAD GR\u00c1FICA", pos=(-1.55,.80), align=TextNode.ALeft,
-            scale=.026, fg=(.82,.89,.84,1), mayChange=False,
+            text="CALIDAD", pos=(1.20,.76), align=TextNode.ALeft,
+            scale=.018, fg=(.62,.76,.87,1), mayChange=False,
         )
+        self._hud_quality.hide()
+        self._hud_zones.hide()
+        self._hud_quality_label=OnscreenText(text="CALIDAD GRÁFICA",pos=(1.49,.96),
+            align=TextNode.ACenter,scale=.020,fg=(.78,.88,.95,1),mayChange=False)
         self._hud_time = OnscreenText(
-            text="ILUMINACI\u00d3N: D\u00cdA", pos=(.30,.80), align=TextNode.ALeft,
-            scale=.024, fg=(.87,.91,.82,1), mayChange=True,
+            text="ILUMINACIÓN", pos=(.12,.76), align=TextNode.ALeft,
+            scale=.018, fg=(.62,.76,.87,1), mayChange=True,
             shadow=(0,0,0,.7),
         )
         self._quality_buttons["LOW"] = DirectButton(
-            text="BAJA", scale=.055, pos=(-.76,0,.80), command=self._set_quality,
+            text="BAJA", scale=.034, pos=(1.48,0,.69), command=self._set_quality,
             extraArgs=["LOW"], frameSize=(-1.4,1.4,-.55,.55),
             frameColor=(.06,.17,.21,1), text_fg=(.94,.97,.96,1), pressEffect=True,
         )
         self._quality_buttons["MEDIUM"] = DirectButton(
-            text="MEDIA", scale=.055, pos=(-.47,0,.80), command=self._set_quality,
+            text="MEDIA", scale=.034, pos=(1.63,0,.69), command=self._set_quality,
             extraArgs=["MEDIUM"], frameSize=(-1.4,1.4,-.55,.55),
             frameColor=(.06,.17,.21,1), text_fg=(.94,.97,.96,1), pressEffect=True,
         )
@@ -893,6 +925,9 @@ class SmartCityApp(ShowBase):
             frameSize=(-2.15,2.15,-.82,.82), frameColor=(.06,.48,.44,1),
             text_fg=(1,.99,.9,1), scale=.045, pressEffect=True,
         )
+        self._start_button=DirectButton(
+            text="INICIAR",pos=(-1.31,0,.69),command=self._start_simulation,
+            frameSize=(-1.75,1.75,-.82,.82),scale=.032,pressEffect=True)
         self._restart_button=DirectButton(
             text="REINICIAR", pos=(-.77,0,.565), command=self._reset_simulation,
             frameSize=(-2.6,2.6,-.82,.82), scale=.045, **control_style)
@@ -933,16 +968,196 @@ class SmartCityApp(ShowBase):
         self._help_frame.hide()
         self._help_text.hide()
         self._hud_perf = OnscreenText(
-            text="FPS --  |  MEMORIA -- MB", pos=(1.28,-.94), align=TextNode.ARight,
-            scale=.026, fg=(.56,.83,.78,1), mayChange=True, shadow=(0,0,0,.7),
+            text="FPS --   /   MEMORIA -- MB", pos=(1.66,.86), align=TextNode.ARight,
+            scale=.018, fg=(.56,.83,.78,1), mayChange=True, shadow=(0,0,0,.7),
         )
+        self._hud_system=OnscreenText(text="SISTEMA ACTIVO",pos=(.82,.91),
+                                      align=TextNode.ACenter,scale=.019,
+                                      fg=(.0,.84,.55,1),mayChange=True)
+        self._speed_buttons = {}
+        for label, value, x in (("0,5x",.5,-.58),("1x",1,-.43),("2x",2,-.28),("5x",5,-.13)):
+            button=DirectButton(text=label,scale=.031,pos=(x,0,.69),
+                                command=self._set_speed,extraArgs=[value],
+                                frameSize=(-.8,.8,-.7,.7),pressEffect=True)
+            self._speed_buttons[value]=button
+        self._speed_caption=OnscreenText(text="VELOCIDAD",pos=(-.355,.76),
+                                         align=TextNode.ACenter,scale=.021,
+                                         fg=(.62,.76,.87,1),mayChange=False)
+
+        # Keep the control groups aligned on one shared horizontal grid.
+        self._hud_header_frame["frameSize"]=(-1.78,1.78,-.11,.11)
+        self._hud_header_frame.setPos(0,0,.89)
+        self._hud_control_frame["frameSize"]=(-1.78,1.78,-.12,.12)
+        self._hud_control_frame.setPos(0,0,.70)
+        control_groups=(
+            (-1.44,.66,"SIMULACIÓN"),
+            (-.72,.66,"VELOCIDAD"),
+            (0.0,.66,"ILUMINACIÓN"),
+            (.72,.66,"ZONAS"),
+            (1.44,.66,"CAPAS"),
+        )
+        for card,(x,width,_title) in zip(self._hud_control_cards,control_groups):
+            card["frameSize"]=(-width/2,width/2,-.115,.115)
+            card.setPos(x,0,.70)
+            card["frameColor"]=(.018,.052,.072,.96)
+            card.setTransparency(TransparencyAttrib.MAlpha)
+        for rule in self._hud_control_rules:
+            rule.hide()
+        for label in self._hud_control_labels:
+            label.hide()
+        self._hud_group_labels=[]
+        for x,_width,title in control_groups:
+            self._hud_group_labels.append(OnscreenText(text=title,pos=(x,.785),
+                align=TextNode.ACenter,scale=.022,fg=(.72,.92,.98,1),mayChange=False))
+        self._speed_caption.hide()
+        self._start_button.setPos(-1.59,0,.70)
+        self._pause_button.setPos(-1.44,0,.70)
+        self._restart_button.setPos(-1.29,0,.70)
+        self._start_button.setScale(.032)
+        self._pause_button.setScale(.032)
+        self._restart_button.setScale(.032)
+        for button,x in zip(self._speed_buttons.values(),(-.96,-.80,-.64,-.48)):
+            button.setPos(x,0,.70)
+        for mode,x in zip(("AUTO","DAY","AFTERNOON","NIGHT"),(-.24,-.08,.08,.24)):
+            self._time_buttons[mode].setPos(x,0,.70)
+            self._time_buttons[mode].setScale(.024)
+        for zone,x in zip("ABCD",(.51,.65,.79,.93)):
+            self._zone_buttons[zone].setPos(x,0,.70)
+            self._zone_buttons[zone].setScale(.031)
+        self._layer_buttons["electrical"]["text"]="ELÉCTRICA"
+        self._layer_buttons["electrical"]["frameSize"]=(-3.7,3.7,-.7,.7)
+        self._layer_buttons["electrical"]["text_align"]=TextNode.ACenter
+        self._layer_buttons["electrical"].setPos(1.29,0,.715)
+        self._layer_buttons["electrical"].setScale(.024)
+        self._layer_buttons["gpon"]["frameSize"]=(-3.7,3.7,-.7,.7)
+        self._layer_buttons["gpon"]["text_align"]=TextNode.ACenter
+        self._layer_buttons["gpon"].setPos(1.29,0,.665)
+        self._layer_buttons["gpon"].setScale(.024)
+        self._quality_buttons["LOW"].setPos(1.39,0,.91)
+        self._quality_buttons["MEDIUM"].setPos(1.56,0,.91)
+        self._quality_buttons["LOW"].setScale(.029)
+        self._quality_buttons["MEDIUM"].setScale(.029)
+        self._help_button.setPos(1.62,0,.615)
+        self._help_button.setScale(.021)
+        self._hud_time.setPos(.48,.91)
+
+        self._sidebar_frame=DirectFrame(frameColor=(.015,.045,.07,.97),
+                                        frameSize=(-.235,.295,-.40,.40),
+                                        pos=(-1.55,0,-.045),relief=1)
+        self._sidebar_frame.setTransparency(TransparencyAttrib.MAlpha)
+        nav_items=(("01  Vista 3D",self._set_camera_home),
+                   ("02  Resumen general",self._set_camera_home),
+                   ("03  Red eléctrica",self._toggle_electrical),
+                   ("04  Telecomunicaciones",self._toggle_gpon),
+                   ("05  Semáforos",self._toggle_traffic_layer),
+                   ("06  Alumbrado público",self._toggle_lighting_layer),
+                   ("07  Zonas",lambda:self._focus_zone(self._active_zone)),
+                   ("08  Equipos y activos",self._focus_selected),
+                   ("09  Alarmas y eventos",self._toggle_help),
+                   ("10  Inteligencia artificial",lambda:self._focus_zone("D")),
+                   ("11  Reportes",self._toggle_help),
+                   ("12  Configuración",lambda:self._set_quality(
+                       "LOW" if self._quality_mode=="MEDIUM" else "MEDIUM")))
+        self._sidebar_buttons=[]
+        self._minimap_buttons=[]
+        for index,(label,action) in enumerate(nav_items):
+            button=DirectButton(text=label,scale=.032,pos=(-1.55,0,.295-index*.064),
+                                command=action,frameSize=(-7.35,9.2,-.72,.72),
+                                frameColor=(.045,.10,.15,.96),text_align=TextNode.ALeft,
+                                pressEffect=True)
+            button.control_text_scale=.70
+            self._sidebar_buttons.append(button)
+        self._minimap_frame=DirectFrame(frameColor=(.015,.045,.07,.98),
+                                        frameSize=(-.265,.265,-.16,.16),
+                                        pos=(-1.515,0,-.77),relief=1)
+        self._minimap_title=OnscreenText(text="MAPA DE ZONAS",pos=(-1.515,-.665),
+                                         align=TextNode.ACenter,scale=.020,
+                                         fg=(.76,.87,.94,1),mayChange=False)
+        for index,(zone,color) in enumerate((("A",(.05,.43,.98,1)),("B",(.96,.43,.10,1)),
+                                              ("C",(.88,.20,.30,1)),("D",(.05,.66,.40,1)))):
+            button=DirectButton(text=zone,scale=.039,pos=(-1.625+(index%2)*.22,0,-.72-(index//2)*.12),
+                                command=self._focus_zone,extraArgs=[zone],
+                                frameSize=(-.7,.7,-.65,.65),frameColor=color,
+                                text_fg=(1,1,1,1),pressEffect=True)
+            button.control_text_scale=.8
+            self._minimap_buttons.append(button)
+
+        self._kpi_labels=[]
+        self._kpi_values=[]
+        kpi_defs=(("ont_total","ONT REGISTRADAS"),("ont_online","ONT CONECTADAS"),
+                  ("pon_ports","PUERTOS PON"),("power_kw","DEMANDA kW"),
+                  ("active_zones","ZONAS ACTIVAS"),("alarms","ALARMAS"))
+        self._hud_kpi_defs=kpi_defs
+        self._hud_kpi_cards=[]
+        for index,(key,title) in enumerate(kpi_defs):
+            x=-1.02+index*.505
+            card=DirectFrame(frameColor=(.018,.065,.10,.97),frameSize=(-.245,.245,-.047,.047),
+                             pos=(x,0,.465),relief=1)
+            card.setTransparency(TransparencyAttrib.MAlpha)
+            self._hud_kpi_cards.append(card)
+            self._kpi_labels.append(OnscreenText(text=title,pos=(x,.484),align=TextNode.ACenter,
+                                                  scale=.025,fg=(.78,.89,.96,1),mayChange=False))
+            self._kpi_values.append(OnscreenText(text="—",pos=(x,.445),align=TextNode.ACenter,
+                                                  scale=.040,fg=(.97,.99,1,1),mayChange=True))
+
+        self._bottom_frames=[]
+        panel_x=(-.88,-.12,.64,1.40)
+        titles=("RED ELÉCTRICA","TELECOMUNICACIONES GPON","ALARMAS Y EVENTOS","LEYENDA DE CAPAS")
+        self._bottom_values=[]
+        for x,title in zip(panel_x,titles):
+            panel=DirectFrame(frameColor=(.012,.04,.065,.97),frameSize=(-.365,.365,-.18,.18),
+                              pos=(x,0,-.78),relief=1)
+            panel.setTransparency(TransparencyAttrib.MAlpha)
+            self._bottom_frames.append(panel)
+            OnscreenText(text=title,pos=(x,-.635),align=TextNode.ACenter,scale=.027,
+                         fg=(.68,.87,.96,1),mayChange=False)
+            self._bottom_values.append(OnscreenText(text="Esperando telemetría…",pos=(x,-.76),
+                         align=TextNode.ACenter,scale=.024,fg=(.97,.99,1,1),mayChange=True))
+        self._zone_bars=[]
+        for index,zone in enumerate("ABCD"):
+            x=panel_x[0]-.25+index*.167
+            self._zone_bars.append((zone,x,DirectFrame(
+                frameColor=((.05,.55,.95,1),(.96,.48,.12,1),(.90,.19,.32,1),(.05,.68,.43,1))[index],
+                frameSize=(-.035,.035,0,.10),pos=(x,0,-.91),relief=0)))
+            OnscreenText(text=zone,pos=(x,-.94),align=TextNode.ACenter,scale=.013,
+                         fg=(.69,.81,.90,1),mayChange=False)
+        self._asset_panel=DirectFrame(frameColor=(.012,.04,.065,.97),frameSize=(-.23,.23,-.25,.25),
+                                      pos=(1.51,0,.13),relief=1)
+        self._asset_panel.setTransparency(TransparencyAttrib.MAlpha)
+        self._asset_panel_title=OnscreenText(text="EQUIPO SELECCIONADO",pos=(1.51,.31),
+                          align=TextNode.ACenter,scale=.026,fg=(.88,.95,1,1),mayChange=False)
+        self._asset_panel_text=OnscreenText(text="Selecciona un activo en la ciudad",
+                          pos=(1.51,.20),align=TextNode.ACenter,scale=.024,
+                          fg=(.88,.93,.96,1),mayChange=True)
+        self._asset_focus_button=DirectButton(text="ENFOCAR EN 3D",scale=.033,pos=(1.51,0,-.02),
+                          command=self._focus_selected,frameSize=(-3.8,3.8,-.75,.75),pressEffect=True)
+        self._asset_details_button=DirectButton(text="VER DETALLES",scale=.033,pos=(1.51,0,-.09),
+                          command=self._show_asset_details,frameSize=(-3.8,3.8,-.75,.75),pressEffect=True)
+        self._extra_layer_buttons={}
+        self._extra_layer_buttons["traffic"]=DirectButton(
+            text="SEMÁFOROS",scale=.023,pos=(1.59,0,.715),command=self._toggle_traffic_layer,
+            frameSize=(-3.7,3.7,-.7,.7),text_align=TextNode.ACenter,pressEffect=True)
+        self._extra_layer_buttons["lighting"]=DirectButton(
+            text="ALUMBRADO",scale=.023,pos=(1.59,0,.665),command=self._toggle_lighting_layer,
+            frameSize=(-3.7,3.7,-.7,.7),text_align=TextNode.ACenter,pressEffect=True)
+        self._all_layers_button=DirectButton(text="TODAS",scale=.021,pos=(1.45,0,.615),
+                          command=self._enable_all_layers,frameSize=(-2.2,2.2,-.7,.7),pressEffect=True)
+        self._help_button.setPos(1.59,0,.615)
+        self._all_layers_button.setPos(1.29,0,.615)
+        self._layer_caption=OnscreenText(text="CAPAS",pos=(1.49,.76),align=TextNode.ACenter,
+                                          scale=.022,fg=(.78,.88,.95,1),mayChange=False)
+        self._layer_caption.hide()
         all_buttons=(
             list(self._layer_buttons.values())+list(self._quality_buttons.values())
-            +[self._pause_button,self._restart_button,self._help_button]
+            +[self._start_button,self._pause_button,self._restart_button,self._help_button]
             +list(self._time_buttons.values())+list(self._zone_buttons.values())
+            +list(self._speed_buttons.values())+self._sidebar_buttons
+            +list(self._extra_layer_buttons.values())
+            +[self._all_layers_button,self._asset_focus_button,self._asset_details_button]
         )
         for button in all_buttons:
             self._style_control_button(button)
+        self._style_control_button(self._start_button,active=True)
         self._set_quality(self._quality_mode)
         for mode,button in self._time_buttons.items():
             self._style_control_button(button,active=(mode=="AUTO"))
@@ -950,6 +1165,110 @@ class SmartCityApp(ShowBase):
             self._style_control_button(button,active=(label==self._active_zone))
         for name,button in self._layer_buttons.items():
             self._style_control_button(button,active=self._layers[name])
+        for value,button in self._speed_buttons.items():
+            self._style_control_button(button,active=(value==1.0))
+        for name,button in self._extra_layer_buttons.items():
+            enabled=self._traffic_layer_enabled if name=="traffic" else self._lighting_layer_enabled
+            self._style_control_button(button,active=enabled)
+        self._style_control_button(self._all_layers_button)
+        # Keep the brand and header labels above all translucent control panels.
+        self._hud_title.destroy()
+        self._hud_title=OnscreenText(text="JONGOX  |  SMART CITY 3D",
+            pos=(-1.58,.91),align=TextNode.ALeft,scale=.047,
+            fg=(.88,.93,.9,1),mayChange=False,shadow=(0,0,0,.7))
+        self._hud_help.destroy()
+        self._hud_help=OnscreenText(
+            text="GEMELO DIGITAL URBANO   |   Rueda: zoom / Clic derecho: orbitar / WASD: desplazar",
+            pos=(-1.58,.86),align=TextNode.ALeft,scale=.024,
+            fg=(.65,.77,.78,1),mayChange=False,shadow=(0,0,0,.7))
+        self._hud_quality_label.destroy()
+        self._hud_quality_label=OnscreenText(text="CALIDAD GRÁFICA",pos=(1.49,.96),
+            align=TextNode.ACenter,scale=.020,fg=(.78,.88,.95,1),mayChange=False)
+
+    def _set_speed(self, value):
+        try:
+            value=float(value)
+        except (TypeError,ValueError):
+            return
+        if value not in (.5,1.0,2.0,5.0):
+            return
+        self._speed_multiplier=value
+        for speed,button in self._speed_buttons.items():
+            self._style_control_button(button,active=(speed==value))
+
+    def _toggle_electrical(self):
+        self._toggle_layer("electrical")
+
+    def _toggle_gpon(self):
+        self._toggle_layer("gpon")
+
+    def _toggle_traffic_layer(self):
+        self._traffic_layer_enabled=not self._traffic_layer_enabled
+        self._traffic_layer_root.show() if self._traffic_layer_enabled else self._traffic_layer_root.hide()
+        self._style_control_button(self._extra_layer_buttons["traffic"],active=self._traffic_layer_enabled)
+
+    def _toggle_lighting_layer(self):
+        self._lighting_layer_enabled=not self._lighting_layer_enabled
+        self._lighting_layer_root.show() if self._lighting_layer_enabled else self._lighting_layer_root.hide()
+        self._style_control_button(self._extra_layer_buttons["lighting"],active=self._lighting_layer_enabled)
+
+    def _enable_all_layers(self):
+        self._set_layer_enabled("electrical",True)
+        self._set_layer_enabled("gpon",True)
+        self._traffic_layer_enabled=True
+        self._traffic_layer_root.show()
+        self._lighting_layer_enabled=True
+        self._lighting_layer_root.show()
+        self._style_control_button(self._extra_layer_buttons["traffic"],active=True)
+        self._style_control_button(self._extra_layer_buttons["lighting"],active=True)
+
+    def _focus_selected(self):
+        if self._selected:
+            self._focus_asset(self._selected)
+
+    def _show_asset_details(self):
+        if self._selected:
+            self._show_hud_message(f"Ficha de {self._selected}: consulta Equipos y activos en el centro de operaciones")
+        else:
+            self._show_hud_message("Selecciona primero un equipo en la ciudad")
+
+    def _set_selected_hud(self, asset_id):
+        parts=asset_id.split("-")
+        zone=parts[1] if len(parts)>1 and parts[1] in "ABCD" else "sin zona asociada"
+        if asset_id.startswith("TX-"):
+            kind="Transformador"
+        elif asset_id.startswith(("OLT-","PON-","ONT-","GPON-")):
+            kind="Telecomunicaciones GPON"
+        elif asset_id.startswith(("TL-","SIGNAL-")):
+            kind="Semáforo"
+        elif asset_id.startswith("LAMP-"):
+            kind="Alumbrado público"
+        else:
+            kind="Activo urbano"
+        self._asset_panel_text.setText(f"{asset_id}\n{kind}\nZona {zone}\nDatos disponibles en el centro de operaciones")
+
+    def _show_hud_message(self, message):
+        self._asset_panel_text.setText(message)
+
+    def _update_hud_metrics(self, values):
+        if not isinstance(values,dict):
+            return
+        self._hud_metrics=values
+        for label,(key,_title) in zip(self._kpi_values,self._hud_kpi_defs):
+            value=values.get(key,"—")
+            label.setText(f"{value:,.1f}" if isinstance(value,float) else f"{value:,}" if isinstance(value,int) else str(value))
+        zones=values.get("zones",{})
+        power=sum(float(item.get("power_kw",0)) for item in zones.values()) or 1.0
+        for zone,x,bar in self._zone_bars:
+            ratio=max(.04,min(1.0,float(zones.get(zone,{}).get("power_kw",0))/power))
+            bar["frameSize"]=(-.035,.035,0,.10*ratio)
+            bar.setPos(x,0,-.91)
+        self._bottom_values[0].setText(f"Total {values.get('power_kw',0):,.1f} kW  /  {values.get('energy_kwh',0):,.2f} kWh")
+        self._bottom_values[1].setText(
+            f"ONT {values.get('ont_online',0):,} / {values.get('ont_total',0):,} conectadas  /  "
+            f"{values.get('pon_ports',0):,} puertos PON")
+        self._bottom_values[2].setText(f"{values.get('alarms',0):,} alarmas activas / datos simulados")
+        self._bottom_values[3].setText("Eléctrica / GPON / semáforos / alumbrado")
 
     def _toggle_help(self):
         if self._help_frame.isHidden():
@@ -1419,7 +1738,7 @@ class SmartCityApp(ShowBase):
         # between clock updates. Read the clock directly so traffic advances
         # with elapsed simulation time instead of depending on render cadence.
         frame_dt=max(0.0,float(ClockObject.getGlobalClock().getDt()))
-        simulation_dt=0.0 if self._paused else min(frame_dt,.1)
+        simulation_dt=0.0 if self._paused else min(frame_dt,.1)*self._speed_multiplier
         self._simulation_time += simulation_dt
         self._update_city(self._simulation_time,simulation_dt)
         self._perf_frames += 1
@@ -1439,14 +1758,28 @@ class SmartCityApp(ShowBase):
         self._paused=not self._paused
         self._pause_button["text"]="REANUDAR" if self._paused else "PAUSAR"
         self._style_control_button(self._pause_button,active=self._paused)
+        self._style_control_button(self._start_button,active=False)
+        self._hud_system.setText("SIMULACIÓN PAUSADA" if self._paused else "SISTEMA ACTIVO")
+
+    def _start_simulation(self):
+        self._paused=False
+        self._pause_button["text"]="PAUSAR"
+        self._style_control_button(self._pause_button)
+        self._style_control_button(self._start_button,active=True)
+        self._hud_system.setText("SISTEMA ACTIVO")
 
     def _reset_simulation(self):
         self._paused=False
         self._simulation_time=0.0
+        self._speed_multiplier=1.0
+        self._hud_system.setText("SISTEMA ACTIVO")
         self._time_of_day_override=None
         self._lighting_elapsed=0.0
         self._pause_button["text"]="PAUSAR"
         self._style_control_button(self._pause_button)
+        self._style_control_button(self._start_button,active=True)
+        for speed,button in self._speed_buttons.items():
+            self._style_control_button(button,active=(speed==1.0))
         for mode,button in self._time_buttons.items():
             self._style_control_button(button,active=(mode=="AUTO"))
         for car in self._cars:
@@ -1565,7 +1898,7 @@ class SmartCityApp(ShowBase):
         self._selected=asset_id
         self._selected_node=path
         self._selected_node.setColorScale(1.35,1.25,.72,1)
-        self._hud_selection.setText(f"Activo seleccionado: {asset_id}")
+        self._set_selected_hud(asset_id)
         if self._selection_queue is not None:
             try:
                 self._selection_queue.put_nowait({"asset_id": asset_id})
