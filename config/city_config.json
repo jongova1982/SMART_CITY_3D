@@ -1,0 +1,11 @@
+{
+  "title": "JONGOX SMART CITY 3D",
+  "low_graphics": true,
+  "simulation_interval_seconds": 1.0,
+  "zones": [
+    {"id": "A", "name": "Residencial", "buildings": 36, "color": [0.18, 0.55, 0.38]},
+    {"id": "B", "name": "Comercial", "buildings": 28, "color": [0.2, 0.42, 0.78]},
+    {"id": "C", "name": "Industrial", "buildings": 18, "color": [0.78, 0.45, 0.18]},
+    {"id": "D", "name": "Tecnologica", "buildings": 22, "color": [0.56, 0.3, 0.7]}
+  ]
+}

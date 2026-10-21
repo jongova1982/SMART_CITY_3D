@@ -1,0 +1,1 @@
+"""Lightweight custom dashboard widgets."""
