@@ -34,6 +34,13 @@ _CUBE_TRIS = (
 )
 _CUBE_FACES = ((0,3,2,1),(4,5,6,7),(0,1,5,4),(1,2,6,5),(2,3,7,6),(3,0,4,7))
 
+_HUD_COLORS = {
+    "header": (.012, .030, .046, .96),
+    "panel": (.020, .052, .074, .96),
+    "card": (.030, .073, .098, .96),
+    "accent": (.08, .58, .78, 1),
+}
+
 
 class SmartCityApp(ShowBase):
     """A readable, efficient city model: buildings are batched by material."""
@@ -68,6 +75,7 @@ class SmartCityApp(ShowBase):
         self._layers = {"electrical": True, "gpon": True}
         self.layers = {"electrical": [], "gpon": []}
         self._assets = {}
+        self._button_textures = {}
         self._traffic_signals = []
         self._traffic_layer_enabled = True
         self._traffic_layer_root = self.render.attachNewNode("traffic-signal-layer")
@@ -79,6 +87,8 @@ class SmartCityApp(ShowBase):
         self._simulation_time = 0.0
         self._speed_multiplier = 1.0
         self._hud_metrics = {}
+        self._hud_visible = True
+        self._hud_hidden_widgets = []
         self._paused = False
         self._time_of_day_override = None
         self._quality_mode = "MEDIUM"
@@ -112,6 +122,7 @@ class SmartCityApp(ShowBase):
         self._build_city(cfg)
         self._make_hud()
         self._update_city(0.0)
+        self.accept("f1", self._toggle_hud_visibility)
         self.accept("r", self._set_camera_home)
         for key in ("w", "a", "s", "d", "arrow_up", "arrow_down", "arrow_left", "arrow_right", "q", "e", "+", "=", "-", "_"):
             self.accept(key, self._key_down, [key])
@@ -236,32 +247,6 @@ class SmartCityApp(ShowBase):
         texture.setWrapU(Texture.WMRepeat)
         texture.setWrapV(Texture.WMRepeat)
         texture.setMinfilter(Texture.FTLinearMipmapLinear)
-        texture.setMagfilter(Texture.FTLinear)
-        return texture
-
-    @staticmethod
-    def _make_button_texture(name, aspect, fill, border):
-        """Build a lightweight rounded cyan button with a thin red outline."""
-        height = 128
-        width = max(128, int(height * aspect))
-        radius = height * .22
-        stroke = max(3, height * .026)
-        image = PNMImage(width, height, 4)
-        image.alphaFill(0)
-        for y in range(height):
-            for x in range(width):
-                qx = abs(x + .5 - width / 2) - (width / 2 - radius)
-                qy = abs(y + .5 - height / 2) - (height / 2 - radius)
-                outside = (math.hypot(max(qx, 0), max(qy, 0))
-                           + min(max(qx, qy), 0) - radius)
-                if outside <= 0:
-                    color = border if outside >= -stroke else fill
-                    image.setXelA(x, y, *color)
-        texture = Texture(name)
-        texture.load(image)
-        texture.setWrapU(Texture.WMClamp)
-        texture.setWrapV(Texture.WMClamp)
-        texture.setMinfilter(Texture.FTLinear)
         texture.setMagfilter(Texture.FTLinear)
         return texture
 
@@ -783,37 +768,103 @@ class SmartCityApp(ShowBase):
         label.setBillboardPointEye()
         return label
 
-    def _control_button_textures(self, aspect, active=False):
-        aspect = min(8.0, max(1.0, round(aspect * 2) / 2))
-        key = (aspect, bool(active))
-        if key not in self._button_texture_cache:
+    def _button_texture(self, palette, shape, state, active=False, aspect=2.0):
+        """Build a small glossy rounded button texture in memory, with no external art."""
+        aspect = max(1.0,round(aspect*10)/10)
+        key = (palette, shape, state, active, aspect)
+        if key in self._button_textures:
+            return self._button_textures[key]
+
+        colors = {
+            "cyan": ((.10,.78,.91),(.02,.31,.55),(.48,.97,1)),
+            "navy": ((.17,.39,.51),(.025,.105,.17),(.28,.78,.94)),
+            "red": ((.96,.35,.43),(.43,.055,.13),(1,.68,.68)),
+            "blue": ((.20,.62,1),(.015,.25,.72),(.58,.88,1)),
+            "orange": ((1,.63,.18),(.67,.20,.025),(1,.88,.52)),
+            "green": ((.13,.83,.55),(.015,.36,.23),(.58,1,.78)),
+        }
+        top, bottom, rim = colors.get(palette, colors["navy"])
+        if palette in ("blue","orange","red","green"):
+            factor = 1.0 if active else .76
+            top = tuple(channel*factor for channel in top)
+            bottom = tuple(channel*factor for channel in bottom)
             if active:
-                fills = ((.04,.42,.77,1),(.02,.29,.58,1),(.12,.62,.98,1),(.47,.67,.82,1))
-                outline = (.00,.75,1,1)
-            else:
-                fills = ((.075,.15,.22,1),(.045,.10,.16,1),(.11,.22,.30,1),(.38,.53,.64,1))
-                outline = (.14,.30,.42,1)
-            self._button_texture_cache[key] = tuple(
-                self._make_button_texture(f"control-{key}-{index}",aspect,fill,outline)
-                for index,fill in enumerate(fills)
-            )
-        return self._button_texture_cache[key]
+                rim = tuple(min(1,channel*1.16) for channel in rim)
+        if state == 1:  # depressed: lower the gloss and deepen the face
+            top = tuple(channel*.72 for channel in top)
+            bottom = tuple(channel*.72 for channel in bottom)
+        elif state == 2:  # rollover: brighter face and rim
+            top = tuple(min(1, channel*1.12+.04) for channel in top)
+            rim = tuple(min(1, channel*1.08) for channel in rim)
+        elif state == 3:  # disabled
+            top, bottom, rim = (.24,.32,.37),(.10,.15,.19),(.38,.48,.52)
+
+        height = 64
+        width = max(64,round(height*aspect))
+        image = PNMImage(width, height, 4)
+        corner_radius = height*.49 if shape == "pill" else height*.19
+        for y in range(height):
+            for x in range(width):
+                if shape == "circle":
+                    distance = math.hypot(x+.5-width/2,y+.5-height/2)-min(width,height)*.49
+                else:
+                    cx = min(max(x+.5, corner_radius), width-corner_radius)
+                    cy = min(max(y+.5, corner_radius), height-corner_radius)
+                    distance = math.hypot(x+.5-cx, y+.5-cy)-corner_radius
+                alpha = max(0.0, min(1.0, .5-distance))
+                if alpha <= 0:
+                    image.setXelA(x,y,0,0,0,0)
+                    continue
+
+                vertical = y/max(1,height-1)
+                mix = max(0.0,min(1.0,(1-vertical)*.76+.12))
+                color = [top[i]*(1-mix)+bottom[i]*mix for i in range(3)]
+                # A narrow bright top rim and a soft reflected sheen give the
+                # button depth without washing out its label.
+                if vertical > .91:
+                    edge_mix = min(1,(vertical-.91)/.07)*.72
+                    color = [color[i]*(1-edge_mix)+rim[i]*edge_mix for i in range(3)]
+                sheen = max(0.0,1-abs(vertical-.73)/.23)*.20
+                center_gloss = .86+.14*math.sin(math.pi*(x+.5)/width)
+                color = [min(1,c+(1-c)*sheen*center_gloss) for c in color]
+                if vertical < .10:
+                    shade = .20*(1-vertical/.10)
+                    color = [c*(1-shade) for c in color]
+                if shape == "circle":
+                    icon_x=(x+.5-width/2)/(min(width,height)/2)
+                    icon_y=(y+.5-height/2)/(height/2)
+                    if abs(icon_x)<.48 and any(abs(icon_y-line)<.055 for line in (-.32,0,.32)):
+                        color=[.98,1,1]
+                image.setXelA(x,y,*color,alpha)
+
+        texture = Texture(f"hud-button-{palette}-{shape}-{state}")
+        texture.load(image)
+        texture.setWrapU(Texture.WMClamp)
+        texture.setWrapV(Texture.WMClamp)
+        texture.setMinfilter(Texture.FTLinear)
+        texture.setMagfilter(Texture.FTLinear)
+        self._button_textures[key] = texture
+        return texture
 
     def _style_control_button(self, button, active=False):
-        left,right,bottom,top = button["frameSize"]
-        aspect = (right-left) / max(top-bottom,1e-6)
-        button["frameTexture"] = self._control_button_textures(aspect,active)
-        button["frameColor"] = (1,1,1,1)
+        palette = getattr(button,"control_palette",None) or ("cyan" if active else "navy")
+        frame = button["frameSize"]
+        aspect = abs(frame[1]-frame[0])/max(.001,abs(frame[3]-frame[2]))
+        shape = getattr(button,"control_shape",None) or ("pill" if aspect >= 1.95 else "rounded")
+        # Each DirectButton state has its own glossy texture so press and hover
+        # remain visible even on the dark translucent HUD.
+        button["frameTexture"] = tuple(self._button_texture(palette,shape,state,active,aspect)
+                                       for state in range(4))
+        button["frameColor"] = ((1,1,1,1),)*4
         button["relief"] = "flat"
         button["borderWidth"] = (0,0)
-        button["text_fg"] = (.97,.99,1,1) if active else (.86,.93,.98,1)
+        button["text_fg"] = (1,1,1,1) if active or palette != "navy" else (.93,.98,1,1)
         button["text_scale"] = getattr(button,"control_text_scale",.95)
         if self._button_font:
             button["text_font"] = self._button_font
         button.setTransparency(TransparencyAttrib.MAlpha)
 
     def _make_hud(self):
-        self._button_texture_cache = {}
         bold_font_path = Path("C:/Windows/Fonts/arialbd.ttf")
         self._button_font = None
         if bold_font_path.exists():
@@ -823,7 +874,7 @@ class SmartCityApp(ShowBase):
             except OSError:
                 self._button_font = None
         self._hud_header_frame = DirectFrame(
-            frameColor=(.012,.032,.048,.99),
+            frameColor=_HUD_COLORS["header"],
             frameSize=(-1.68,1.68,-.142,.142), pos=(0,0,.862), relief=1,
         )
         self._hud_header_frame.setTransparency(TransparencyAttrib.MAlpha)
@@ -849,15 +900,15 @@ class SmartCityApp(ShowBase):
         self._hud_control_frame.setTransparency(TransparencyAttrib.MAlpha)
         self._hud_control_frame.hide()
         self._hud_control_cards = [
-            DirectFrame(frameColor=(.025,.063,.079,.99),
+            DirectFrame(frameColor=_HUD_COLORS["card"],
                         frameSize=(-.47,.47,-.115,.115),pos=(-1.29,0,.70),relief=1),
-            DirectFrame(frameColor=(.025,.063,.079,.99),
+            DirectFrame(frameColor=_HUD_COLORS["card"],
                         frameSize=(-.33,.33,-.115,.115),pos=(-.47,0,.70),relief=1),
-            DirectFrame(frameColor=(.025,.063,.079,.99),
+            DirectFrame(frameColor=_HUD_COLORS["card"],
                         frameSize=(-.40,.40,-.115,.115),pos=(.28,0,.70),relief=1),
-            DirectFrame(frameColor=(.025,.063,.079,.99),
+            DirectFrame(frameColor=_HUD_COLORS["card"],
                         frameSize=(-.235,.235,-.115,.115),pos=(.935,0,.70),relief=1),
-            DirectFrame(frameColor=(.025,.063,.079,.99),
+            DirectFrame(frameColor=_HUD_COLORS["card"],
                         frameSize=(-.29,.29,-.115,.115),pos=(1.48,0,.70),relief=1),
         ]
         self._hud_control_rules = [
@@ -931,7 +982,10 @@ class SmartCityApp(ShowBase):
         self._restart_button=DirectButton(
             text="REINICIAR", pos=(-.77,0,.565), command=self._reset_simulation,
             frameSize=(-2.6,2.6,-.82,.82), scale=.045, **control_style)
-        self._restart_button.control_text_scale=.76
+        self._restart_button.control_palette="red"
+        self._start_button.control_text_scale=.72
+        self._pause_button.control_text_scale=.70
+        self._restart_button.control_text_scale=.68
         for mode,label,x,width in (("AUTO","AUTOM\u00c1TICO",-.22,2.85),
                                    ("DAY","D\u00cdA",.00,1.25),
                                    ("AFTERNOON","TARDE",.22,1.65),
@@ -947,6 +1001,8 @@ class SmartCityApp(ShowBase):
                 extraArgs=[zone], frameSize=(-.78,.78,-.7,.7),
                 frameColor=(.06,.17,.21,.99), text_fg=(.94,.97,.96,1), pressEffect=True,
             )
+            self._zone_buttons[zone].control_palette={
+                "A":"blue","B":"orange","C":"red","D":"green"}[zone]
         self._help_button = DirectButton(
             text="AYUDA", scale=.024, pos=(1.49,0,.565), command=self._toggle_help,
             frameSize=(-2.0,2.0,-.8,.8), frameColor=(.08,.25,.32,1),
@@ -990,25 +1046,29 @@ class SmartCityApp(ShowBase):
         self._hud_control_frame["frameSize"]=(-1.78,1.78,-.12,.12)
         self._hud_control_frame.setPos(0,0,.70)
         control_groups=(
-            (-1.44,.66,"SIMULACIÓN"),
-            (-.72,.66,"VELOCIDAD"),
-            (0.0,.66,"ILUMINACIÓN"),
-            (.72,.66,"ZONAS"),
-            (1.44,.66,"CAPAS"),
+            (-1.44,.62,"SIMULACIÓN"),
+            (-.72,.62,"VELOCIDAD"),
+            (0.0,.62,"ILUMINACIÓN"),
+            (.72,.62,"ZONAS"),
+            (1.44,.62,"CAPAS"),
         )
         for card,(x,width,_title) in zip(self._hud_control_cards,control_groups):
-            card["frameSize"]=(-width/2,width/2,-.115,.115)
-            card.setPos(x,0,.70)
-            card["frameColor"]=(.018,.052,.072,.96)
+            card["frameSize"]=(-width/2,width/2,-.10,.10)
+            card.setPos(x,0,.715)
+            card["frameColor"]=_HUD_COLORS["card"]
             card.setTransparency(TransparencyAttrib.MAlpha)
         for rule in self._hud_control_rules:
             rule.hide()
         for label in self._hud_control_labels:
             label.hide()
         self._hud_group_labels=[]
+        self._hud_control_accents=[]
         for x,_width,title in control_groups:
             self._hud_group_labels.append(OnscreenText(text=title,pos=(x,.785),
-                align=TextNode.ACenter,scale=.022,fg=(.72,.92,.98,1),mayChange=False))
+                align=TextNode.ACenter,scale=.024,fg=(.84,.94,.98,1),mayChange=False))
+            accent=DirectFrame(frameColor=_HUD_COLORS["accent"],
+                frameSize=(-.30,.30,-.002,.002),pos=(x,0,.811),relief=0)
+            self._hud_control_accents.append(accent)
         self._speed_caption.hide()
         self._start_button.setPos(-1.59,0,.70)
         self._pause_button.setPos(-1.44,0,.70)
@@ -1017,11 +1077,24 @@ class SmartCityApp(ShowBase):
         self._pause_button.setScale(.032)
         self._restart_button.setScale(.032)
         for button,x in zip(self._speed_buttons.values(),(-.96,-.80,-.64,-.48)):
+            button["frameSize"] = (-1.22,1.22,-.72,.72)
+            button.control_text_scale=.84
             button.setPos(x,0,.70)
+        for button,x in zip((self._start_button,self._pause_button,self._restart_button),
+                            (-1.59,-1.44,-1.29)):
+            # Keep the three simulation controls the same size. Their spacing is
+            # fixed by the group grid, so the frame and its bevel must stay
+            # inside that spacing even when PAUSAR changes to REANUDAR.
+            button["frameSize"] = (-1.90,1.90,-.82,.82)
+            button["text_align"] = TextNode.ACenter
+            button.control_text_scale=.64
+            button.setPos(x,0,.70)
+            button.setScale(.032)
         for mode,x in zip(("AUTO","DAY","AFTERNOON","NIGHT"),(-.24,-.08,.08,.24)):
             self._time_buttons[mode].setPos(x,0,.70)
             self._time_buttons[mode].setScale(.024)
         for zone,x in zip("ABCD",(.51,.65,.79,.93)):
+            self._zone_buttons[zone]["frameSize"] = (-.92,.92,-.72,.72)
             self._zone_buttons[zone].setPos(x,0,.70)
             self._zone_buttons[zone].setScale(.031)
         self._layer_buttons["electrical"]["text"]="ELÉCTRICA"
@@ -1037,11 +1110,14 @@ class SmartCityApp(ShowBase):
         self._quality_buttons["MEDIUM"].setPos(1.56,0,.91)
         self._quality_buttons["LOW"].setScale(.029)
         self._quality_buttons["MEDIUM"].setScale(.029)
+        for button in self._quality_buttons.values():
+            button["frameSize"] = (-1.72,1.72,-.58,.58)
+            button.control_text_scale=.82
         self._help_button.setPos(1.62,0,.615)
         self._help_button.setScale(.021)
         self._hud_time.setPos(.48,.91)
 
-        self._sidebar_frame=DirectFrame(frameColor=(.015,.045,.07,.97),
+        self._sidebar_frame=DirectFrame(frameColor=_HUD_COLORS["panel"],
                                         frameSize=(-.235,.295,-.40,.40),
                                         pos=(-1.55,0,-.045),relief=1)
         self._sidebar_frame.setTransparency(TransparencyAttrib.MAlpha)
@@ -1059,28 +1135,17 @@ class SmartCityApp(ShowBase):
                    ("12  Configuración",lambda:self._set_quality(
                        "LOW" if self._quality_mode=="MEDIUM" else "MEDIUM")))
         self._sidebar_buttons=[]
-        self._minimap_buttons=[]
         for index,(label,action) in enumerate(nav_items):
             button=DirectButton(text=label,scale=.032,pos=(-1.55,0,.295-index*.064),
-                                command=action,frameSize=(-7.35,9.2,-.72,.72),
+                                command=action,frameSize=(-7.35,5.8,-.72,.72),
                                 frameColor=(.045,.10,.15,.96),text_align=TextNode.ALeft,
+                                text_pos=(-4.7,-.17),
                                 pressEffect=True)
             button.control_text_scale=.70
+            # Navigation rows need a restrained rounded-rectangle profile;
+            # a full capsule becomes too elongated across the sidebar.
+            button.control_shape="rounded"
             self._sidebar_buttons.append(button)
-        self._minimap_frame=DirectFrame(frameColor=(.015,.045,.07,.98),
-                                        frameSize=(-.265,.265,-.16,.16),
-                                        pos=(-1.515,0,-.77),relief=1)
-        self._minimap_title=OnscreenText(text="MAPA DE ZONAS",pos=(-1.515,-.665),
-                                         align=TextNode.ACenter,scale=.020,
-                                         fg=(.76,.87,.94,1),mayChange=False)
-        for index,(zone,color) in enumerate((("A",(.05,.43,.98,1)),("B",(.96,.43,.10,1)),
-                                              ("C",(.88,.20,.30,1)),("D",(.05,.66,.40,1)))):
-            button=DirectButton(text=zone,scale=.039,pos=(-1.625+(index%2)*.22,0,-.72-(index//2)*.12),
-                                command=self._focus_zone,extraArgs=[zone],
-                                frameSize=(-.7,.7,-.65,.65),frameColor=color,
-                                text_fg=(1,1,1,1),pressEffect=True)
-            button.control_text_scale=.8
-            self._minimap_buttons.append(button)
 
         self._kpi_labels=[]
         self._kpi_values=[]
@@ -1090,8 +1155,10 @@ class SmartCityApp(ShowBase):
         self._hud_kpi_defs=kpi_defs
         self._hud_kpi_cards=[]
         for index,(key,title) in enumerate(kpi_defs):
-            x=-1.02+index*.505
-            card=DirectFrame(frameColor=(.018,.065,.10,.97),frameSize=(-.245,.245,-.047,.047),
+            # Six equal cards occupy the usable band between the left rail
+            # and the right edge, with a visible gutter between each card.
+            x=-.99+index*.50
+            card=DirectFrame(frameColor=_HUD_COLORS["card"],frameSize=(-.19,.19,-.040,.040),
                              pos=(x,0,.465),relief=1)
             card.setTransparency(TransparencyAttrib.MAlpha)
             self._hud_kpi_cards.append(card)
@@ -1101,37 +1168,58 @@ class SmartCityApp(ShowBase):
                                                   scale=.040,fg=(.97,.99,1,1),mayChange=True))
 
         self._bottom_frames=[]
-        panel_x=(-.88,-.12,.64,1.40)
+        panel_x=(-1.14,-.38,.38,1.14)
         titles=("RED ELÉCTRICA","TELECOMUNICACIONES GPON","ALARMAS Y EVENTOS","LEYENDA DE CAPAS")
         self._bottom_values=[]
         for x,title in zip(panel_x,titles):
-            panel=DirectFrame(frameColor=(.012,.04,.065,.97),frameSize=(-.365,.365,-.18,.18),
+            panel=DirectFrame(frameColor=_HUD_COLORS["panel"],frameSize=(-.365,.365,-.18,.18),
                               pos=(x,0,-.78),relief=1)
             panel.setTransparency(TransparencyAttrib.MAlpha)
             self._bottom_frames.append(panel)
             OnscreenText(text=title,pos=(x,-.635),align=TextNode.ACenter,scale=.027,
                          fg=(.68,.87,.96,1),mayChange=False)
-            self._bottom_values.append(OnscreenText(text="Esperando telemetría…",pos=(x,-.76),
-                         align=TextNode.ACenter,scale=.024,fg=(.97,.99,1,1),mayChange=True))
+            self._bottom_values.append(OnscreenText(text="Esperando telemetría…",pos=(x,-.72),
+                         align=TextNode.ACenter,scale=.025,fg=(.97,.99,1,1),mayChange=True))
         self._zone_bars=[]
+        zone_chart_colors=((.24,.70,1,1),(1,.60,.20,1),(.98,.30,.42,1),(.10,.82,.55,1))
         for index,zone in enumerate("ABCD"):
-            x=panel_x[0]-.25+index*.167
-            self._zone_bars.append((zone,x,DirectFrame(
-                frameColor=((.05,.55,.95,1),(.96,.48,.12,1),(.90,.19,.32,1),(.05,.68,.43,1))[index],
-                frameSize=(-.035,.035,0,.10),pos=(x,0,-.91),relief=0)))
-            OnscreenText(text=zone,pos=(x,-.94),align=TextNode.ACenter,scale=.013,
-                         fg=(.69,.81,.90,1),mayChange=False)
-        self._asset_panel=DirectFrame(frameColor=(.012,.04,.065,.97),frameSize=(-.23,.23,-.25,.25),
+            row=OnscreenText(text=f"ZONA {zone}  [..........]  -- kW",
+                pos=(panel_x[0],-.785-index*.039),align=TextNode.ACenter,scale=.022,
+                fg=zone_chart_colors[index],mayChange=True)
+            row.hide()
+            self._zone_bars.append((zone,row))
+        self._gpon_ratio_label=OnscreenText(
+            text="GPON  --  [..........]",pos=(panel_x[1],-.825),
+            align=TextNode.ACenter,scale=.022,fg=(.22,.83,.96,1),mayChange=True)
+        self._gpon_ratio_label.hide()
+        self._bottom_values[2].hide()
+        self._alarm_status_text=OnscreenText(
+            text="Esperando telemetría",pos=(panel_x[2],-.765),
+            align=TextNode.ACenter,scale=.022,fg=(.70,.82,.88,1),mayChange=True)
+        self._alarm_status_text.hide()
+        self._bottom_values[3].hide()
+        legend_items=(
+            ("RED ELÉCTRICA",(.98,.30,.38,1)),
+            ("RED GPON",(.18,.77,.98,1)),
+            ("SEMÁFOROS",(1,.68,.20,1)),
+            ("ALUMBRADO",(.83,.91,.72,1)),
+        )
+        self._legend_texts=[]
+        for index,(label,color) in enumerate(legend_items):
+            self._legend_texts.append(OnscreenText(
+                text=f"-- {label}",pos=(panel_x[3],-.72-index*.047),
+                align=TextNode.ACenter,scale=.020,fg=color,mayChange=False))
+        self._asset_panel=DirectFrame(frameColor=_HUD_COLORS["panel"],frameSize=(-.21,.21,-.22,.22),
                                       pos=(1.51,0,.13),relief=1)
         self._asset_panel.setTransparency(TransparencyAttrib.MAlpha)
         self._asset_panel_title=OnscreenText(text="EQUIPO SELECCIONADO",pos=(1.51,.31),
                           align=TextNode.ACenter,scale=.026,fg=(.88,.95,1,1),mayChange=False)
-        self._asset_panel_text=OnscreenText(text="Selecciona un activo en la ciudad",
-                          pos=(1.51,.20),align=TextNode.ACenter,scale=.024,
+        self._asset_panel_text=OnscreenText(text="Selecciona un activo\nen la ciudad",
+                          pos=(1.51,.20),align=TextNode.ACenter,scale=.025,
                           fg=(.88,.93,.96,1),mayChange=True)
-        self._asset_focus_button=DirectButton(text="ENFOCAR EN 3D",scale=.033,pos=(1.51,0,-.02),
+        self._asset_focus_button=DirectButton(text="ENFOCAR EN 3D",scale=.033,pos=(1.51,0,.04),
                           command=self._focus_selected,frameSize=(-3.8,3.8,-.75,.75),pressEffect=True)
-        self._asset_details_button=DirectButton(text="VER DETALLES",scale=.033,pos=(1.51,0,-.09),
+        self._asset_details_button=DirectButton(text="VER DETALLES",scale=.033,pos=(1.51,0,-.035),
                           command=self._show_asset_details,frameSize=(-3.8,3.8,-.75,.75),pressEffect=True)
         self._extra_layer_buttons={}
         self._extra_layer_buttons["traffic"]=DirectButton(
@@ -1157,6 +1245,8 @@ class SmartCityApp(ShowBase):
         )
         for button in all_buttons:
             self._style_control_button(button)
+        if self._sidebar_buttons:
+            self._style_control_button(self._sidebar_buttons[0],active=True)
         self._style_control_button(self._start_button,active=True)
         self._set_quality(self._quality_mode)
         for mode,button in self._time_buttons.items():
@@ -1184,6 +1274,35 @@ class SmartCityApp(ShowBase):
         self._hud_quality_label.destroy()
         self._hud_quality_label=OnscreenText(text="CALIDAD GRÁFICA",pos=(1.49,.96),
             align=TextNode.ACenter,scale=.020,fg=(.78,.88,.95,1),mayChange=False)
+
+        # Keep the toggle in aspect2d so Panda's standard HUD hit testing sees it.
+        self._hud_toggle_button=DirectButton(
+            parent=self.aspect2d,text="",scale=.06,pos=(-1.65,0,.49),
+            frameSize=(-1,1,-1,1),command=self._toggle_hud_visibility,
+            text_align=TextNode.ACenter,pressEffect=True,sortOrder=10000,
+        )
+        self._hud_toggle_button.control_palette="red"
+        self._hud_toggle_button.control_shape="circle"
+        self._hud_toggle_button.control_text_scale=.85
+        self._style_control_button(self._hud_toggle_button,active=True)
+
+    def _toggle_hud_visibility(self):
+        if self._hud_visible:
+            self._hud_hidden_widgets=[]
+            toggle_node=self._hud_toggle_button.node()
+            for widget in self.aspect2d.getChildren():
+                if widget.node() == toggle_node:
+                    continue
+                was_hidden=widget.isHidden()
+                self._hud_hidden_widgets.append((widget,was_hidden))
+                widget.hide()
+            self._hud_visible=False
+        else:
+            for widget,was_hidden in self._hud_hidden_widgets:
+                if not was_hidden:
+                    widget.show()
+            self._hud_hidden_widgets=[]
+            self._hud_visible=True
 
     def _set_speed(self, value):
         try:
@@ -1228,9 +1347,10 @@ class SmartCityApp(ShowBase):
 
     def _show_asset_details(self):
         if self._selected:
-            self._show_hud_message(f"Ficha de {self._selected}: consulta Equipos y activos en el centro de operaciones")
+            self._show_hud_message(
+                f"Ficha de {self._selected}\nConsulta Equipos y activos\nen el centro de operaciones")
         else:
-            self._show_hud_message("Selecciona primero un equipo en la ciudad")
+            self._show_hud_message("Selecciona primero un equipo\nen la ciudad")
 
     def _set_selected_hud(self, asset_id):
         parts=asset_id.split("-")
@@ -1245,7 +1365,7 @@ class SmartCityApp(ShowBase):
             kind="Alumbrado público"
         else:
             kind="Activo urbano"
-        self._asset_panel_text.setText(f"{asset_id}\n{kind}\nZona {zone}\nDatos disponibles en el centro de operaciones")
+        self._asset_panel_text.setText(f"{asset_id}\n{kind}\nZona {zone}\nFicha en centro de operaciones")
 
     def _show_hud_message(self, message):
         self._asset_panel_text.setText(message)
@@ -1258,17 +1378,48 @@ class SmartCityApp(ShowBase):
             value=values.get(key,"—")
             label.setText(f"{value:,.1f}" if isinstance(value,float) else f"{value:,}" if isinstance(value,int) else str(value))
         zones=values.get("zones",{})
-        power=sum(float(item.get("power_kw",0)) for item in zones.values()) or 1.0
-        for zone,x,bar in self._zone_bars:
-            ratio=max(.04,min(1.0,float(zones.get(zone,{}).get("power_kw",0))/power))
-            bar["frameSize"]=(-.035,.035,0,.10*ratio)
-            bar.setPos(x,0,-.91)
-        self._bottom_values[0].setText(f"Total {values.get('power_kw',0):,.1f} kW  /  {values.get('energy_kwh',0):,.2f} kWh")
+        zone_power={zone:max(0.0,float(zones.get(zone,{}).get("power_kw",0)))
+                    for zone in "ABCD"}
+        max_zone_power=max(zone_power.values(),default=0.0)
+        for zone,row in self._zone_bars:
+            value=zone_power[zone]
+            if max_zone_power<=0:
+                row.hide()
+                continue
+            filled=max(0,min(10,round(10*value/max_zone_power)))
+            meter="#"*filled+"."*(10-filled)
+            row.setText(f"ZONA {zone}  [{meter}]  {value:,.0f} kW")
+            row.show()
+        try:
+            total_onts=max(0.0,float(values.get("ont_total",0) or 0))
+            online_onts=max(0.0,float(values.get("ont_online",0) or 0))
+        except (TypeError,ValueError):
+            total_onts=online_onts=0.0
+        connected_ratio=max(0.0,min(1.0,online_onts/total_onts)) if total_onts else 0.0
+        if total_onts:
+            connected_slots=max(0,min(10,round(10*connected_ratio)))
+            meter="#"*connected_slots+"."*(10-connected_slots)
+            self._gpon_ratio_label.setText(f"GPON {connected_ratio:.0%}  [{meter}]")
+            self._gpon_ratio_label.show()
+        else:
+            self._gpon_ratio_label.hide()
+        self._bottom_values[0].setText(
+            f"Potencia total: {values.get('power_kw',0):,.1f} kW\n"
+            f"Energía acumulada: {values.get('energy_kwh',0):,.2f} kWh")
         self._bottom_values[1].setText(
-            f"ONT {values.get('ont_online',0):,} / {values.get('ont_total',0):,} conectadas  /  "
-            f"{values.get('pon_ports',0):,} puertos PON")
-        self._bottom_values[2].setText(f"{values.get('alarms',0):,} alarmas activas / datos simulados")
-        self._bottom_values[3].setText("Eléctrica / GPON / semáforos / alumbrado")
+            f"ONT conectadas: {values.get('ont_online',0):,} / {values.get('ont_total',0):,}\n"
+            f"Puertos PON: {values.get('pon_ports',0):,}")
+        try:
+            alarm_count=max(0,int(values.get("alarms",0) or 0))
+        except (TypeError,ValueError):
+            alarm_count=0
+        if alarm_count:
+            self._alarm_status_text.setText(f"REVISAR EVENTOS\n{alarm_count:,} alarmas activas")
+            self._alarm_status_text.setFg((1,.38,.42,1))
+        else:
+            self._alarm_status_text.setText("SISTEMA ESTABLE\nSin alarmas activas")
+            self._alarm_status_text.setFg((.10,.88,.58,1))
+        self._alarm_status_text.show()
 
     def _toggle_help(self):
         if self._help_frame.isHidden():
